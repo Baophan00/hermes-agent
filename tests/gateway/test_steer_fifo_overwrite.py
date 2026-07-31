@@ -1,104 +1,97 @@
-"""Regression test for #75164 — /steer fallback must not overwrite FIFO head.
+"""Regression tests for #75164 — /steer fallback must not overwrite FIFO head.
 
-Before the fix, _busy_steer_command() in gateway/run.py used direct assignment
-adapter._pending_messages[quick_key] = queued_event in both fallback branches,
-which overwrote the existing FIFO head (Q1) and placed the newer steer ahead
-of the existing overflow (Q2). The fix routes both branches through
-_enqueue_fifo(), which preserves the FIFO contract: pending slot = head,
-queued_events = overflow tail.
+Uses the real gateway test fixtures (tests/gateway/test_steer_command.py) to
+exercise both /steer fallback paths through _handle_message, proving that a
+pre-queued Q1/Q2 survives a /steer Q3 dispatch.
 
-This test reproduces the exact scenario from the issue:
-  1. Queue Q1 (slot) + Q2 (overflow)
-  2. Dispatch /steer Q3 with agent in _AGENT_PENDING_SENTINEL state
-  3. Assert: Q1, Q2, Q3 survive in arrival order
+Covers:
+- pending-sentinel path (agent not booted yet) -> _enqueue_fifo preserves Q1
+- no-steer() path (agent lacks steer()) -> _enqueue_fifo preserves Q1
 """
 from __future__ import annotations
 
-import importlib.util
-import sys
-import types
-from pathlib import Path
-
 import pytest
 
-_REPO = Path(__file__).resolve().parents[2]
-_GATEWAY_RUN = _REPO / "gateway" / "run.py"
+from gateway.run import _AGENT_PENDING_SENTINEL
+from tests.gateway.test_steer_command import (
+    _make_event,
+    _make_runner,
+    _session_entry,
+    _make_source,
+)
+from gateway.session import build_session_key
+from unittest.mock import MagicMock
 
 
-def _load_gateway_run():
-    spec = importlib.util.spec_from_file_location("gateway_run_75164", _GATEWAY_RUN)
-    mod = importlib.util.module_from_spec(spec)
-    mod.logger = types.SimpleNamespace(debug=lambda *a, **k: None, warning=lambda *a, **k: None)
-    sys.modules["gateway_run_75164"] = mod
-    try:
-        spec.loader.exec_module(mod)
-    except Exception:
-        pass
-    return mod
+def _prequeue(runner, adapter, sk):
+    """Pre-stage Q1 in the pending slot and Q2 in the overflow tail."""
+    from gateway.platforms.base import MessageEvent, MessageType
+
+    # Ensure _queued_events is initialized (mirrors GatewayRunner.__init__)
+    if not hasattr(runner, "_queued_events"):
+        runner._queued_events = {}
+
+    q1 = MessageEvent(
+        text="Q1",
+        source=_make_source(),
+        message_id="m1",
+        channel_context="ctx1",
+        message_type=MessageType.TEXT,
+    )
+    q2 = MessageEvent(
+        text="Q2",
+        source=_make_source(),
+        message_id="m2",
+        channel_context="ctx2",
+        message_type=MessageType.TEXT,
+    )
+    # Q1 -> pending slot (head), Q2 -> overflow tail
+    runner._enqueue_fifo(sk, q1, adapter)
+    runner._enqueue_fifo(sk, q2, adapter)
+    assert adapter._pending_messages[sk].text == "Q1"
+    assert runner._queued_events[sk][0].text == "Q2"
 
 
-def _make_runner(mod):
-    runner = types.SimpleNamespace()
-    runner._queued_events = {}
-    runner._pending_messages = {}  # not used by live path but kept for parity
-    runner._enqueue_fifo = mod.GatewayRunner._enqueue_fifo.__get__(runner, mod.GatewayRunner)
-    return runner
+@pytest.mark.asyncio
+async def test_steer_pending_sentinel_preserves_fifo_head():
+    """Issue #75164: /steer Q3 must not overwrite pre-queued Q1."""
+    runner, adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+    runner._running_agents[sk] = _AGENT_PENDING_SENTINEL
+
+    _prequeue(runner, adapter, sk)
+
+    result = await runner._handle_message(
+        _make_event("/steer wait up", channel_context="ctx3")
+    )
+    assert result is not None
+    assert "queued" in result.lower()
+
+    # Q1 still in slot, Q2 in overflow, Q3 appended to overflow — order preserved
+    assert adapter._pending_messages[sk].text == "Q1"
+    overflow = runner._queued_events[sk]
+    texts = [msg.text for msg in overflow]
+    assert texts == ["Q2", "wait up"], f"FIFO order broken: {texts}"
 
 
-class _Adapter:
-    def __init__(self):
-        self._pending_messages = {}
+@pytest.mark.asyncio
+async def test_steer_no_steer_method_preserves_fifo_head():
+    """Issue #75164: no-steer() fallback must not overwrite pre-queued Q1."""
+    runner, adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
 
+    # Bare mock with NO steer() method
+    runner._running_agents[sk] = MagicMock(spec=[])
 
-class _Event:
-    def __init__(self, text):
-        self.text = text
+    _prequeue(runner, adapter, sk)
 
+    result = await runner._handle_message(
+        _make_event("/steer fallback", channel_context="ctx3")
+    )
+    assert result is not None
+    assert "queued" in result.lower()
 
-def test_steer_fallback_preserves_fifo_order():
-    """Q1 in slot, Q2 in overflow; /steer Q3 must yield Q1, Q2, Q3."""
-    mod = _load_gateway_run()
-    runner = _make_runner(mod)
-    adapter = _Adapter()
-
-    Q1 = _Event("Q1")
-    Q2 = _Event("Q2")
-    Q3 = _Event("Q3")
-
-    # Step 1: queue Q1 (slot) + Q2 (overflow) — exactly what _enqueue_fifo does
-    runner._enqueue_fifo("sess", Q1, adapter)
-    assert list(adapter._pending_messages.values()) == [Q1]
-
-    runner._enqueue_fifo("sess", Q2, adapter)
-    assert list(runner._queued_events["sess"]) == [Q2]
-
-    # Step 2: /steer Q3 via fallback (the buggy path was direct assignment)
-    runner._enqueue_fifo("sess", Q3, adapter)
-
-    # Step 3: drain — order must be Q1, Q2, Q3
-    drained = []
-    if "sess" in adapter._pending_messages:
-        drained.append(adapter._pending_messages.pop("sess"))
-    drained.extend(runner._queued_events.get("sess", []))
-    texts = [e.text for e in drained]
-    assert texts == ["Q1", "Q2", "Q3"], f"FIFO order broken: {texts}"
-
-
-def test_steer_does_not_overwrite_existing_slot():
-    """Direct assignment would lose Q1; _enqueue_fifo must preserve it."""
-    mod = _load_gateway_run()
-    runner = _make_runner(mod)
-    adapter = _Adapter()
-
-    Q1 = _Event("Q1")
-    Q3 = _Event("Q3")
-
-    # Q1 already in slot (simulating prior queued follow-up)
-    adapter._pending_messages["sess"] = Q1
-
-    # /steer Q3 via the fixed path
-    runner._enqueue_fifo("sess", Q3, adapter)
-
-    # Q1 must survive in the slot (not overwritten), Q3 goes to overflow
-    assert adapter._pending_messages["sess"] is Q1
-    assert runner._queued_events["sess"][-1] is Q3
+    assert adapter._pending_messages[sk].text == "Q1"
+    overflow = runner._queued_events[sk]
+    texts = [msg.text for msg in overflow]
+    assert texts == ["Q2", "fallback"], f"FIFO order broken: {texts}"
