@@ -746,6 +746,7 @@ def build_turn_context(
             messages,
             system_prompt=active_system_prompt or "",
             tools=agent.tools or None,
+            exclude_stale_thinking=True,
         )
         _compressor = agent.context_compressor
         # getattr guard: minimal compressor doubles (SimpleNamespace in the
