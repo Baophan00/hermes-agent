@@ -851,15 +851,46 @@ def _pid_exists(pid: int) -> bool:
         pass  # Fall through to stdlib fallback.
     if _IS_WINDOWS:
         return _pid_exists_win32_ctypes(pid)
-    if _posix_is_zombie(pid):  # a zombie still answers os.kill(pid, 0)
-        return False
+    # psutil missing (stripped install / scaffold phase). Catch the same
+    # zombie case as the psutil path above (issue #42126): a zombie
+    # answers os.kill(pid, 0) successfully, so without this check
+    # ``--replace`` would wait on a dead PID and abort with exit 1.
     try:
-        os.kill(pid, 0)  # windows-footgun: ok — POSIX-only branch (the whole point of _pid_exists)
-    except PermissionError:
-        return True  # Exists but we can't signal it.
-    except OSError:  # ProcessLookupError included
+        stat_fields = (
+            Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8").split()
+        )
+        if len(stat_fields) > 2 and stat_fields[2] == "Z":
+            return False
+    except FileNotFoundError:
+        # No /proc (macOS/BSD) — fall back to ps state.
+        try:
+            r = subprocess.run(
+                ["ps", "-o", "state=", "-p", str(int(pid))],
+                capture_output=True,
+                text=True, encoding='utf-8', errors='replace',
+                timeout=5,
+            )
+            if r.returncode == 0 and r.stdout.strip().startswith("Z"):
+                return False
+        except Exception as exc:
+            # If we cannot determine zombie state, treat as dead rather
+            # than silently falling through to os.kill(), which cannot
+            # detect zombies on POSIX. A false "alive" here causes
+            # --replace to wait forever on a reaped PID.
+            logger.debug("zombie check failed for pid %s: %s", pid, exc)
+            return False
+    except (IndexError, PermissionError, OSError):
+        pass
+    try:
+        os.kill(int(pid), 0)  # windows-footgun: ok — POSIX-only branch (the whole point of _pid_exists)
+        return True
+    except ProcessLookupError:
         return False
-    return True
+    except PermissionError:
+        # Process exists but we can't signal it — still alive.
+        return True
+    except OSError:
+        return False
 
 
 def _posix_is_zombie(pid: int) -> bool:
