@@ -3572,7 +3572,8 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
     Tries in order:
-    1. ``shutil.which("hermes")`` — standard PATH lookup
+    1. ``shutil.which("hermes")`` — standard PATH lookup, verified against
+       the Hermes installation directory
     2. ``sys.executable -m hermes_cli.main`` — fallback when Hermes is running
        from a venv/module invocation and the ``hermes`` shim is not on PATH
 
@@ -3582,7 +3583,26 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
 
     hermes_bin = shutil.which("hermes")
     if hermes_bin:
-        return [hermes_bin]
+        # Security: verify the resolved path belongs to the Hermes installation
+        # to prevent PATH hijack attacks where a malicious "hermes" executable
+        # earlier in PATH could be executed instead.
+        try:
+            resolved = Path(hermes_bin).resolve()
+            # Check if resolved path is within a known Hermes location
+            # (site-packages, the project root, or a standard install location)
+            hermes_root = Path(__file__).resolve().parent.parent.parent
+            site_packages = Path(sys.executable).resolve().parent.parent / "bin"
+            # Allow if it's under hermes project root or standard install locations
+            if (
+                hermes_root in resolved.parents
+                or site_packages in resolved.parents
+                or Path("/usr/local/bin") in resolved.parents
+                or Path.home() / ".local/bin" in resolved.parents
+            ):
+                return [hermes_bin]
+        except (OSError, ValueError):
+            # If verification fails, fall through to safer fallback
+            pass
 
     try:
         import importlib.util
