@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import logging
 import math
+import locale
+import sys
 import re
 import time
 from dataclasses import dataclass
@@ -112,62 +114,34 @@ def _recover_unicode_encode_error(
     codec under a non-UTF-8 locale. Sanitizes in place; bounded by the caller's
     ``_unicode_sanitization_passes < 2`` guard (surrogate strip, then ASCII-only)."""
     _err_str = str(api_error).lower()
-    _is_ascii_codec = "'ascii'" in _err_str or "ascii" in _err_str
+    # Check the actual system encoding -- never infer from error text.
+    # A UnicodeEncodeError about a non-ASCII API key also contains "ascii"
+    # but does NOT mean the system locale is ASCII-only.
+    _is_ascii_codec = sys.getdefaultencoding() == 'ascii' or locale.getpreferredencoding().lower() in ('ascii', 'ansi_x3.4-1968')
     # utf-8 refusing U+D800..U+DFFF ("surrogates not allowed").
     _is_surrogate_error = "surrogate" in _err_str or ("'utf-8'" in _err_str and not _is_ascii_codec)
-    # Sanitize `messages` AND `api_messages` (may carry reasoning_content/reasoning_details),
-    # plus `api_kwargs` and `prefill_messages`. Every sanitizer runs (no short-circuit).
+    # Sanitize messages AND api_messages (may carry reasoning_content/reasoning_details),
+    # plus api_kwargs and prefill_messages. Every sanitizer runs (no short-circuit).
     _prefill = getattr(agent, "prefill_messages", None)
     _surrogates_found = _sanitize_messages_surrogates(messages)
     _surrogates_found |= isinstance(api_messages, list) and _sanitize_messages_surrogates(api_messages)
     _surrogates_found |= isinstance(api_kwargs, dict) and _sanitize_structure_surrogates(api_kwargs)
     _surrogates_found |= isinstance(_prefill, list) and _sanitize_messages_surrogates(_prefill)
-    # Gate the retry on the error type, not on whether anything was found — a new
+    # Gate the retry on the error type, not on whether anything was found -- a new
     # transformed field could slip through.
     if _surrogates_found or _is_surrogate_error:
         agent._unicode_sanitization_passes += 1
         agent._buffer_vprint(
-            "⚠️  Stripped invalid surrogate characters from messages. Retrying..."
+            "Stripped invalid surrogate characters from messages. Retrying..."
             if _surrogates_found else
-            "⚠️  Surrogate encoding error — retrying after full-payload sanitization..."
+            "Surrogate encoding error -- retrying after full-payload sanitization..."
         )
         return True, active_system_prompt
-    if not _is_ascii_codec:
-        return False, active_system_prompt
 
-    agent._force_ascii_payload = True
-    # Strip all non-ASCII from messages/tool schemas and retry; api_kwargs too so a
-    # non-ASCII transformed field doesn't survive via _build_api_kwargs cache paths.
-    _messages_sanitized = _sanitize_messages_non_ascii(messages)
-    if isinstance(api_messages, list):
-        _sanitize_messages_non_ascii(api_messages)
-    if isinstance(api_kwargs, dict):
-        _sanitize_structure_non_ascii(api_kwargs)
-    _prefill_sanitized = isinstance(_prefill, list) and _sanitize_messages_non_ascii(_prefill)
-    _tools = getattr(agent, "tools", None)
-    _tools_sanitized = isinstance(_tools, list) and _sanitize_tools_non_ascii(_tools)
-
-    _system_sanitized = False
-    if isinstance(active_system_prompt, str):
-        _sanitized_system = _strip_non_ascii(active_system_prompt)
-        if _sanitized_system != active_system_prompt:
-            active_system_prompt = agent._cached_system_prompt = _sanitized_system
-            _system_sanitized = True
-    _ephemeral = getattr(agent, "ephemeral_system_prompt", None)
-    if isinstance(_ephemeral, str) and _strip_non_ascii(_ephemeral) != _ephemeral:
-        agent.ephemeral_system_prompt = _strip_non_ascii(_ephemeral)
-        _system_sanitized = True
-
-    _client_kwargs = getattr(agent, "_client_kwargs", None)
-    _default_headers = _client_kwargs.get("default_headers") if isinstance(_client_kwargs, dict) else None
-    _headers_sanitized = isinstance(_default_headers, dict) and _sanitize_structure_non_ascii(_default_headers)
-
-    # Non-ASCII in the API key makes httpx fail encoding the Authorization header — the
-    # usual persistent cause after message/tool sanitization. Entra ID bearer providers
-    # are callables minting ASCII JWTs; skip them (``_strip_non_ascii`` would crash).
-    # Sanitize the API key — non-ASCII characters in credentials (e.g. ʋ instead of v from a bad copy-paste)
-    # cause httpx to fail when encoding the Authorization header as ASCII. This is the most common cause of
-    # persistent UnicodeEncodeError that survives message/tool sanitization (#6843).
+    # Always sanitize the API key -- non-ASCII characters in credentials cause httpx
+    # to fail when encoding the Authorization header as ASCII.
+    # This is the most common cause of persistent UnicodeEncodeError (#6843).
+    # Entra ID bearer providers are callables minting ASCII JWTs; skip them.
     _credential_sanitized = False
     _raw_key = getattr(agent, "api_key", None) or ""
     if _raw_key and isinstance(_raw_key, str):
@@ -182,76 +156,27 @@ def _recover_unicode_encode_error(
             _credential_sanitized = True
             _vlines(
                 agent,
-                "⚠️  API key contained non-ASCII characters (bad copy-paste?) — stripped them. "
+                "API key contained non-ASCII characters (bad copy-paste?) -- stripped them. "
                 "If auth fails, re-copy the key from your provider's dashboard.",
             )
 
-    # Always retry on ASCII codec detection: _force_ascii_payload sanitizes the full
-    # api_kwargs next iteration even when the checks above find nothing.
+    if not _is_ascii_codec:
+        # Not an ASCII-only locale -- the error was likely from a non-ASCII credential.
+        # Retry after sanitizing the API key above; do NOT strip conversation content.
+        agent._unicode_sanitization_passes += 1
+        return True, active_system_prompt
+
+    # ASCII-only locale: enable full-payload sanitization for the retry path.
+    # NOTE: We do NOT strip non-ASCII from messages/api_messages/api_kwargs here --
+    # that caused permanent data loss in state.db (#117802). The _force_ascii_payload
+    # flag triggers sanitization at the api_kwargs build boundary instead.
+    agent._force_ascii_payload = True
     agent._unicode_sanitization_passes += 1
     _vlines(
         agent,
-        "⚠️  System encoding is ASCII — stripped non-ASCII characters from request payload. Retrying..."
-        if (_messages_sanitized or _prefill_sanitized or _tools_sanitized or _system_sanitized
-            or _headers_sanitized or _credential_sanitized) else
-        "⚠️  System encoding is ASCII — enabling full-payload sanitization for retry...",
+        "System encoding is ASCII -- enabling full-payload sanitization for retry...",
     )
     return True, active_system_prompt
-
-
-def recover_before_classification(
-    agent: Any, api_error: Exception, *, messages: List[Dict[str, Any]], api_messages: Any,
-    api_kwargs: Any, active_system_prompt: Any,
-) -> Tuple[bool, Any]:
-    """Recovery branches that run BEFORE ``classify_api_error``: UnicodeEncodeError
-    sanitization, provider image-content rejection (switch session to text-only), and the
-    Bedrock AnthropicBedrock SDK streaming fallback. Returns ``(retry_now,
-    active_system_prompt)``; the prompt may be ASCII-sanitized in place."""
-    if isinstance(api_error, UnicodeEncodeError) and getattr(agent, '_unicode_sanitization_passes', 0) < 2:
-        _recovered, active_system_prompt = _recover_unicode_encode_error(
-            agent, api_error, messages, api_messages, api_kwargs, active_system_prompt
-        )
-        if _recovered:
-            return True, active_system_prompt
-
-    # Some providers 4xx on image_url content: strip images, mark session
-    # vision-unsupported, retry text-only. English phrase match; extend it.
-    _err_body = ""
-    try:
-        _err_body = str(getattr(api_error, "body", None) or getattr(api_error, "message", None) or str(api_error))
-    except Exception:
-        pass
-    _err_status = getattr(api_error, "status_code", None)
-    # 4xx-only gate: 5xx/timeouts are transient and take the retry path.
-    _status_ok = _err_status is None or (400 <= int(_err_status) < 500)
-    if getattr(agent, "_vision_supported", True) and _looks_like_image_content_rejection(_err_body) and _status_ok:
-        agent._vision_supported = False
-        _imgs_removed = _strip_images_from_messages(messages)
-        if isinstance(api_messages, list):
-            _strip_images_from_messages(api_messages)
-        _vlines(
-            agent,
-            "⚠️  Server rejected image content — switching to text-only mode for this session"
-            + (". Stripped images from history and retrying." if _imgs_removed else "."),
-        )
-        return True, active_system_prompt
-
-    # AnthropicBedrock SDK raises "Unexpected event order" when Bedrock errors before
-    # message_start; fall back to native Converse for this session.
-    if (
-        isinstance(api_error, RuntimeError)
-        and "unexpected event order" in str(api_error).lower()
-        and getattr(agent, "provider", "") == "bedrock"
-        and agent.api_mode == "anthropic_messages"
-        and not getattr(agent, "_bedrock_converse_fallback_attempted", False)
-    ):
-        agent._bedrock_converse_fallback_attempted = True
-        agent.api_mode = "bedrock_converse"
-        agent._bedrock_region = getattr(agent, "_bedrock_region", None) or "us-east-1"
-        agent.client = None  # Drop the AnthropicBedrock client
-        agent._client_kwargs = {}
-        _vlines(agent, "⚠️  AnthropicBedrock SDK streaming failed — falling back to native Converse API for this session.")
-        return True, active_system_prompt
     return False, active_system_prompt
 
 
@@ -1811,3 +1736,59 @@ def route_classified_error(
         return _verdict("continue")
     # Upstream capacity 429: normal retry logic will typically succeed.
     return _verdict("fallthrough")
+
+
+def recover_before_classification(
+    agent: Any, api_error: Exception, *, messages: List[Dict[str, Any]], api_messages: Any,
+    api_kwargs: Any, active_system_prompt: Any,
+) -> Tuple[bool, Any]:
+    """Recovery branches that run BEFORE classify_api_error: UnicodeEncodeError
+    sanitization, provider image-content rejection (switch session to text-only), and the
+    Bedrock AnthropicBedrock SDK streaming fallback. Returns (retry_now,
+    active_system_prompt); the prompt may be ASCII-sanitized in place."""
+    if isinstance(api_error, UnicodeEncodeError) and getattr(agent, '_unicode_sanitization_passes', 0) < 2:
+        _recovered, active_system_prompt = _recover_unicode_encode_error(
+            agent, api_error, messages, api_messages, api_kwargs, active_system_prompt
+        )
+        if _recovered:
+            return True, active_system_prompt
+
+    # Some providers 4xx on image_url content: strip images, mark session
+    # vision-unsupported, retry text-only. English phrase match; extend it.
+    _err_body = ""
+    try:
+        _err_body = str(getattr(api_error, "body", None) or getattr(api_error, "message", None) or str(api_error))
+    except Exception:
+        pass
+    _err_status = getattr(api_error, "status_code", None)
+    # 4xx-only gate: 5xx/timeouts are transient and take the retry path.
+    _status_ok = _err_status is None or (400 <= int(_err_status) < 500)
+    if getattr(agent, "_vision_supported", True) and _looks_like_image_content_rejection(_err_body) and _status_ok:
+        agent._vision_supported = False
+        _imgs_removed = _strip_images_from_messages(messages)
+        if isinstance(api_messages, list):
+            _strip_images_from_messages(api_messages)
+        _vlines(
+            agent,
+            "Server rejected image content -- switching to text-only mode for this session"
+            + (". Stripped images from history and retrying." if _imgs_removed else "."),
+        )
+        return True, active_system_prompt
+
+    # AnthropicBedrock SDK raises "Unexpected event order" when Bedrock errors before
+    # message_start; fall back to native Converse for this session.
+    if (
+        isinstance(api_error, RuntimeError)
+        and "unexpected event order" in str(api_error).lower()
+        and getattr(agent, "provider", "") == "bedrock"
+        and agent.api_mode == "anthropic_messages"
+        and not getattr(agent, "_bedrock_converse_fallback_attempted", False)
+    ):
+        agent._bedrock_converse_fallback_attempted = True
+        agent.api_mode = "bedrock_converse"
+        agent._bedrock_region = getattr(agent, "_bedrock_region", None) or "us-east-1"
+        agent.client = None  # Drop the AnthropicBedrock client
+        agent._client_kwargs = {}
+        _vlines(agent, "AnthropicBedrock SDK streaming failed -- falling back to native Converse API for this session.")
+        return True, active_system_prompt
+    return False, active_system_prompt
