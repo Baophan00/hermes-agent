@@ -20,3 +20,17 @@ class TestDefaultSttLanguage:
         stt = dict(DEFAULT_CONFIG["stt"])
         stt["groq"] = {"language": "he"}
         assert _resolve_stt_language("groq", stt) == "he"
+
+    def test_empty_language_means_autodetect(self, monkeypatch):
+        """#120100: stt.local.language: "" must NOT fall through to stt.language: 'en'."""
+        monkeypatch.delenv("HERMES_LOCAL_STT_LANGUAGE", raising=False)
+        stt = dict(DEFAULT_CONFIG["stt"])
+        stt["local"] = {"language": ""}
+        assert _resolve_stt_language("local", stt) is None
+
+    def test_missing_provider_section_falls_through(self, monkeypatch):
+        monkeypatch.delenv("HERMES_LOCAL_STT_LANGUAGE", raising=False)
+        stt = dict(DEFAULT_CONFIG["stt"])
+        if "kimi" in stt:
+            del stt["kimi"]
+        assert _resolve_stt_language("kimi", stt) == "en"

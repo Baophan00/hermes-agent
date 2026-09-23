@@ -95,13 +95,25 @@ def _resolve_stt_language(
 ) -> Optional[str]:
     """Language hint for an STT provider, first non-empty wins (never ""): ``stt.<provider>.language``
     (plus *extra_keys* aliases, e.g. ``language_code``) > ``stt.language`` > ``HERMES_LOCAL_STT_LANGUAGE``
-    env > None (provider auto-detects)."""
+    env > None (provider auto-detects).
+
+    An explicitly-empty string ``language: ""`` on the provider section means "auto-detect" and
+    suppresses the global ``stt.language`` default. Only fall through to the global default when
+    the provider section has no ``language`` key at all.
+    """
     if stt_config is None:
         stt_config = _load_stt_config()
     provider_cfg = _get_stt_section(stt_config, provider_key)
-    candidates = [provider_cfg.get(key) for key in ("language", *extra_keys)]
-    if isinstance(stt_config, dict):
-        candidates.append(stt_config.get("language"))
+    provider_keys = ("language", *extra_keys)
+    provider_vals = [provider_cfg.get(key) for key in provider_keys if key in provider_cfg]
+    if provider_vals:
+        # Provider section has at least one language key — honor the first one verbatim.
+        # Empty string means "auto-detect" (suppresses the global default).
+        val = provider_vals[0]
+        if isinstance(val, str):
+            return val.strip() or None
+        return None
+    candidates = [stt_config.get("language")] if isinstance(stt_config, dict) else []
     candidates.append(os.getenv(LOCAL_STT_LANGUAGE_ENV))
     return next((c.strip() for c in candidates if isinstance(c, str) and c.strip()), None)
 
