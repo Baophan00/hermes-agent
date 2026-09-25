@@ -946,6 +946,41 @@ class TestSkillsEndpoint:
                     assert set(entry.keys()) >= {"name", "description", "category"}
 
 
+class TestSkillsEndpointRealFunction:
+    """The endpoint must call the real tools.skills_tool._find_all_skills with a
+    signature that matches the definition. #120831: the handler passed
+    include_editorial=True, a kwarg left over from the reverted Wisdom feature
+    (#94266), so every GET /v1/skills raised TypeError and returned 500. The
+    mocked-discovery test above could not catch the drift, so this one exercises
+    the real discovery path against an isolated skills root."""
+
+    @pytest.mark.asyncio
+    async def test_skills_endpoint_uses_real_discovery_signature(self, adapter, tmp_path, monkeypatch):
+        import tools.skills_tool as st
+
+        st._SKILLS_CACHE.clear()
+        skill_dir = tmp_path / "skills" / "creative" / "ascii-art"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: ascii-art\ndescription: ASCII art generation\n---\n# ascii-art\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(st, "_skills_dir", lambda: tmp_path / "skills")
+        monkeypatch.setattr(st, "_get_disabled_skill_names", lambda: set())
+        monkeypatch.setattr("agent.skill_utils.get_external_skills_dirs", lambda: [])
+        monkeypatch.setattr("agent.skill_utils.get_project_skills_dirs", lambda: [])
+        try:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/skills")
+                assert resp.status == 200, await resp.text()
+                data = await resp.json()
+                assert data["object"] == "list"
+                assert [s["name"] for s in data["data"]] == ["ascii-art"]
+        finally:
+            st._SKILLS_CACHE.clear()
+
+
 class TestToolsetsEndpoint:
     @pytest.mark.asyncio
     async def test_toolsets_returns_resolved_tools(self, adapter):
