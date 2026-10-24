@@ -34,6 +34,7 @@ from hermes_cli.middleware import VALID_MIDDLEWARE
 from hermes_cli.plugin_capabilities import plugin_capability_granted
 from hermes_cli.relay_plugin_cutover import RELAY_PLUGINS_CONFIG_ENV, legacy_relay_plugin_keys
 # Sibling modules' names are re-exported here (origin) so plugins and tests keep one import path.
+from hermes_cli.plugins_snapshot import snapshot_plugin_items
 from hermes_cli.plugins_manifest import (
     _CONFIG_SCHEMA_TYPES, SUPPORTED_MANIFEST_VERSION, PluginManifest, _portable_skill_namespace,
     manifest_key, parse_manifest_file, resolve_module_origin, resolve_plugin_load_order,
@@ -1496,7 +1497,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         """Back-compat alias for ``get_platform_handler_factories("telegram")``."""
         return self.get_platform_handler_factories("telegram")
 
-    def snapshot_plugins(self) -> list[tuple[str, "LoadedPlugin"]]:
+    def snapshot_plugins(self) -> list[tuple[str, LoadedPlugin]]:
         """Point-in-time copy of the plugin map for readers that may run while a load mutates it.
 
         Plugin loading runs on a deadline worker (``run_with_load_deadline``); when a load times out the
@@ -1598,7 +1599,7 @@ def _clear_plugin_submodules(manager: Optional[PluginManager]) -> None:
     """
     if manager is None:
         return
-    for loaded in getattr(manager, "_plugins", {}).values():  # tolerates test-double managers
+    for _key, loaded in snapshot_plugin_items(manager):  # tolerates test-double managers
         module_name = getattr(getattr(loaded, "module", None), "__name__", None)
         if not module_name or not module_name.startswith(f"{_NS_PARENT}."):
             continue

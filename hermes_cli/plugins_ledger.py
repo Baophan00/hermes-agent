@@ -230,7 +230,8 @@ class PluginLedgerMixin:
         identity-conditional inverses. Returns ``True`` when anything was found."""
         unload_all = plugin is None
         if unload_all:
-            target_keys = set(self._ownership_ledger) | set(self._plugins)
+            target_keys = set(self._ownership_ledger) | {
+                key for key, _loaded in self.snapshot_plugins()}
             registrations = list(self._registration_order)
         else:
             target_keys = self._unload_target_keys(self._resolve_plugin_key(plugin))

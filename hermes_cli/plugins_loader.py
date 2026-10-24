@@ -26,6 +26,7 @@ from hermes_constants import get_hermes_home, reset_hermes_home_override, set_he
 from registration_lifecycle import replacement_coordinator
 from hermes_cli.plugins_discovery import ENTRY_POINTS_GROUP, _select_entry_point_group
 from hermes_cli.plugins_manifest import PluginManifest, manifest_key, portable_mcp_server_name, validate_config_schema
+from hermes_cli.plugins_snapshot import snapshot_plugin_items
 from hermes_cli.plugins_state import _plugin_settings_entry
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -355,7 +356,7 @@ class PluginLoaderMixin:
         from hermes_cli.plugins_discovery import _get_disabled_plugins, _get_enabled_plugins, gate_manifest
         from hermes_cli.plugins_manifest import requires_hermes_error
         with self._discovery_lock, _plugin_home_scope(self.home_path):
-            failed = next((p.manifest for p in self._plugins.values()
+            failed = next((p.manifest for _key, p in self.snapshot_plugins()
                            if p.error and not p.enabled and p.manifest.kind == "platform"
                            and self._platform_name_from_manifest(p.manifest) == platform_name), None)
             # Re-gate: a placeholder (disabled, not enabled, catalog-removed) or a requires_hermes mismatch

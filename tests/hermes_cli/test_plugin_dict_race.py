@@ -13,6 +13,8 @@ These tests pin both halves of the fix:
 
 import threading
 
+import re
+
 from hermes_cli.plugins import LoadedPlugin, PluginContext, PluginManager
 from hermes_cli.plugins_manifest import PluginManifest
 
@@ -38,7 +40,7 @@ def test_has_plugin_survives_concurrent_loads():
             while not stop.is_set():
                 ctx.has_plugin("p3")
                 ctx.has_plugin("nonexistent-plugin")
-        except BaseException as exc:  # noqa: BLE001 - captured for the assertion below
+        except BaseException as exc:
             errors.append(exc)
 
     hitters = [threading.Thread(target=hammer, daemon=True) for _ in range(4)]
@@ -103,7 +105,7 @@ def test_reader_never_sees_a_half_applied_multi_key_write():
                 gone = {"p0", "p1", "p2", "p3"} - keys
                 if gone and len(gone) != 4:  # torn batch: some but not all of the unload landed
                     errors.append(sorted(gone))
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errors.append(exc)
 
     polls = [threading.Thread(target=poll, daemon=True) for _ in range(3)]
@@ -135,7 +137,7 @@ def test_list_plugins_tolerates_a_concurrent_insert():
         try:
             while not stop.is_set():
                 manager.list_plugins()
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errors.append(exc)
 
     polls = [threading.Thread(target=poll, daemon=True) for _ in range(3)]
@@ -151,3 +153,138 @@ def test_list_plugins_tolerates_a_concurrent_insert():
         thread.join(10)
 
     assert not errors, f"list_plugins() raised under concurrent loads: {errors[:3]!r}"
+
+
+# ---------------------------------------------------------------------------
+# Sibling call paths: every reader outside the manager must go through the
+# snapshot too. These tests stand in an exploding map for ``_plugins``: any
+# direct iteration raises, so a reader that regresses fails deterministically
+# (no threads, no timing).
+# ---------------------------------------------------------------------------
+
+
+class _ExplodingPlugins(dict):
+    """A ``_plugins`` map that raises on iteration unless ``_plugins_lock`` is held.
+
+    Iterating it inside the lock is exactly what ``snapshot_plugins()`` does, so the snapshot
+    keeps working; any other reader iterating the live map fails the test deterministically,
+    standing in for the ``RuntimeError: dictionary changed size during iteration`` a late loader
+    would cause. ``.get()`` stays available: a single lookup does not iterate.
+    """
+
+    def __init__(self, lock, initial):
+        super().__init__(initial)
+        self._lock = lock
+
+    def _guard(self):
+        owned = getattr(self._lock, "_is_owned", None)
+        if callable(owned) and owned():
+            return
+        raise AssertionError("reader iterated the live _plugins map instead of snapshot_plugins()")
+
+    def items(self):
+        self._guard()
+        return super().items()
+
+    def values(self):
+        self._guard()
+        return super().values()
+
+    def keys(self):
+        self._guard()
+        return super().keys()
+
+    def __iter__(self):
+        self._guard()
+        return super().__iter__()
+
+
+def _guard_reader(manager, monkeypatch):
+    """Point the manager at the exploding map, keep snapshot_plugins() real."""
+    calls = []
+    real_snapshot = manager.snapshot_plugins
+
+    def spy():
+        calls.append(1)
+        return real_snapshot()
+
+    monkeypatch.setattr(manager, "snapshot_plugins", spy)
+    manager._plugins = _ExplodingPlugins(manager._plugins_lock, manager._plugins)
+    return calls
+
+
+def test_activation_summaries_reads_the_snapshot(monkeypatch):
+    from hermes_cli.plugins_activation import activation_summaries
+
+    manager = PluginManager()
+    _insert(manager, "probe")
+    calls = _guard_reader(manager, monkeypatch)
+
+    summaries = activation_summaries(manager)
+
+    assert [summary["key"] for summary in summaries] == ["probe"]
+    assert calls
+
+
+def test_dependency_blocked_summaries_reads_the_snapshot(monkeypatch):
+    from hermes_cli.plugins_activation import dependency_blocked_summaries
+
+    manager = PluginManager()
+    _insert(manager, "probe")
+    calls = _guard_reader(manager, monkeypatch)
+
+    assert dependency_blocked_summaries(manager) == []
+    assert calls
+
+
+def test_clear_plugin_submodules_reads_the_snapshot(monkeypatch):
+    from hermes_cli import plugins as plugins_module
+
+    manager = PluginManager()
+    _insert(manager, "probe")
+    calls = _guard_reader(manager, monkeypatch)
+
+    plugins_module._clear_plugin_submodules(manager)
+
+    assert calls
+
+
+def test_unload_all_reads_the_snapshot(monkeypatch):
+    manager = PluginManager()
+    _insert(manager, "probe")
+    calls = _guard_reader(manager, monkeypatch)
+
+    manager.unload()
+
+    assert calls
+
+
+DIRECT_ITERATION_PATTERNS = (
+    r"\._plugins\.(items|values|keys)\(\)",
+    r"sorted\(\s*[\w.]+\\._plugins\s*\)",
+    r"set\(\s*self\\._plugins\s*\)",
+    r"for\s+[\w, ]+\s+in\s+[\w.]+\\._plugins\s*:",
+    r"getattr\([^)]*\"_plugins\"[^)]*\)\.(items|values|keys)\(\)",
+)
+
+# snapshot_plugins() is the one place allowed to iterate the live map.
+_DIRECT_ITERATION_ALLOWED = {"hermes_cli/plugins.py"}
+
+
+def test_no_module_iterates_the_live_plugin_map():
+    """The whole bug class: a new reader must use snapshot_plugins(), not the live dict."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    offenders = []
+    for package in ("hermes_cli", "gateway", "agent", "tui_gateway", "tools"):
+        for path in (root / package).rglob("*.py"):
+            relative = path.relative_to(root).as_posix()
+            if relative in _DIRECT_ITERATION_ALLOWED:
+                continue
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                window = line.replace("_plugins_lock", "")
+                if any(re.search(pattern, window) for pattern in DIRECT_ITERATION_PATTERNS):
+                    offenders.append(f"{relative}:{number}: {line.strip()}")
+
+    assert not offenders, "readers iterating the live plugin map:\n" + "\n".join(offenders)
