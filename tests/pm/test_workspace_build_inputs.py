@@ -331,3 +331,55 @@ def test_a_facts_file_without_published_entries_hides_nothing(tmp_path):
     workspace._copy_core_inputs(core, destination)
 
     assert (destination / "agent/chromium-1208/kept.txt").read_text(encoding="utf-8") == "KEPT\n"
+
+
+def _core_with_explicit_packages(root: Path) -> None:
+    """A core whose pyproject names its packages, the way the real repo does."""
+    root.mkdir()
+    (root / "pyproject.toml").write_text(
+        '[project]\nname="core"\nversion="1.0"\nrequires-python=">=3.11"\n'
+        '[build-system]\nrequires=[]\nbuild-backend="backend"\nbackend-path=["build"]\n'
+        '[tool.setuptools.packages.find]\ninclude=["core"]\n',
+        encoding="utf-8",
+    )
+    (root / "core").mkdir()
+    (root / "core" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "locales").mkdir()
+    (root / "locales" / "en.yaml").write_text("cli.commands.help: Help\n", encoding="utf-8")
+    (root / "skills" / "demo").mkdir(parents=True)
+    (root / "skills" / "demo" / "SKILL.md").write_text("# demo\n", encoding="utf-8")
+    (root / "optional-skills" / "extra").mkdir(parents=True)
+    (root / "optional-skills" / "extra" / "SKILL.md").write_text("# extra\n", encoding="utf-8")
+    (root / "website").mkdir()
+    (root / "website" / "index.html").write_text("<html></html>\n", encoding="utf-8")
+
+
+def test_snapshot_covers_runtime_data_dirs_outside_the_packages(tmp_path):
+    """locales/ and the bundled skill sources are read from the checkout root at runtime (#143870)."""
+    source = tmp_path / "core"
+    _core_with_explicit_packages(source)
+    destination = tmp_path / "snapshot"
+    destination.mkdir()
+
+    workspace._copy_core_inputs(source, destination)
+
+    assert (destination / "core" / "__init__.py").is_file()
+    assert (destination / "locales" / "en.yaml").read_text(encoding="utf-8").startswith("cli.commands.help")
+    assert (destination / "skills" / "demo" / "SKILL.md").is_file()
+    assert (destination / "optional-skills" / "extra" / "SKILL.md").is_file()
+    # A checkout directory the runtime never reads from the root is still not carried over.
+    assert not (destination / "website").exists()
+
+
+def test_snapshot_skips_runtime_data_dirs_that_are_absent(tmp_path):
+    """Optional inputs stay optional: a checkout without optional-skills/ still snapshots."""
+    source = tmp_path / "core"
+    _core_with_explicit_packages(source)
+    shutil.rmtree(source / "optional-skills")
+    destination = tmp_path / "snapshot"
+    destination.mkdir()
+
+    workspace._copy_core_inputs(source, destination)
+
+    assert (destination / "locales").is_dir()
+    assert not (destination / "optional-skills").exists()

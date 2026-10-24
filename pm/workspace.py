@@ -86,6 +86,13 @@ def _published_store_entries(directory: Path) -> frozenset[str]:
     return frozenset(name for name in names if (directory / name).is_dir())
 
 
+# Root directories the runtime reads relative to the checkout although they hold no Python
+# package: the i18n catalogs (``agent/i18n.py::_locales_dir``) and the bundled/optional skill
+# sources (``tools/skills_sync.py``). A snapshot that only carries the ``pyproject`` package
+# roots renders every CLI string as its raw catalog key and ships no bundled skills (#143870).
+_CORE_DATA_DIRS = ("locales", "skills", "optional-skills")
+
+
 def _copy_core_inputs(source: Path, destination: Path) -> None:
     """Build from a writable snapshot, never from signed/read-only source."""
     import fnmatch
@@ -123,6 +130,11 @@ def _copy_core_inputs(source: Path, destination: Path) -> None:
                 and any(fnmatch.fnmatchcase(entry.name, pattern) for pattern in package_roots)):
             target = destination / entry.name
             shutil.copytree(entry, target, ignore=ignore)
+    for name in _CORE_DATA_DIRS:
+        entry = source / name
+        if not entry.is_dir() or entry.is_symlink() or entry.resolve() == destination.resolve():
+            continue
+        shutil.copytree(entry, destination / name, ignore=ignore)
     for name in files:
         entry = source / name
         if not entry.is_file() or entry.is_symlink():
