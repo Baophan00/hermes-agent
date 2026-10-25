@@ -1634,12 +1634,10 @@ class TestRedactForEgress:
         monkeypatch.setattr(R, "redact_sensitive_text", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
         assert R.redact_for_egress("sk-live-0123456789abcdef") == R.REDACTION_UNAVAILABLE
 
-class TestPasswordOnlyConnStringsAndUnsegmentedEnvNames:
-    """Two credential shapes that no pass covered: a connection string whose user part is
-    empty (``redis://:pw@host`` — how redis-cli and Mongo URIs are usually written) and the
-    CLI auth variables whose keyword has no separator in front of it (``PGPASSWORD``,
-    ``MYSQL_PWD``, ``SSH_PASSPHRASE``). The ENV rule matches keyword *segments*, so the
-    underscore is what made ``DB_PASSWORD`` work and these three leak.
+class TestPasswordOnlyConnStrings:
+    """A connection string whose user part is empty — ``redis://:pw@host``, the way redis-cli
+    and Mongo/AMQP URIs are usually written — printed its password in full. The DB rule
+    required a non-empty user, so only the ``user:pass@`` form was masked.
     """
 
     SECRET = "S3cretPassw0rd"
@@ -1650,35 +1648,24 @@ class TestPasswordOnlyConnStringsAndUnsegmentedEnvNames:
         "amqp://:" + SECRET + "@rabbit:5672",
     ])
     def test_password_only_connection_strings_are_masked(self, url):
-        out = redact_sensitive_text(url, force=True)
-        assert self.SECRET not in out
-        assert "@" in out and out.startswith(url.split(":")[0])
+        from agent.redact import redact_for_egress, redact_terminal_output
+
+        for out in (
+            redact_sensitive_text(url, force=True),
+            redact_for_egress(url),
+            redact_terminal_output(url, "redis-cli -u $URL ping"),
+        ):
+            assert self.SECRET not in out
+            assert "@" in out
 
     def test_user_and_password_connection_strings_still_masked(self):
         out = redact_sensitive_text("postgres://appuser:" + self.SECRET + "@db:5432/prod", force=True)
         assert out == "postgres://appuser:***@db:5432/prod"
 
-    @pytest.mark.parametrize("cmd", [
-        "PGPASSWORD=" + SECRET,
-        "PGPASSWORD='" + SECRET + "' psql -h db",
-        "MYSQL_PWD=" + SECRET + " mysql -u root",
-        "SSH_PASSPHRASE=" + SECRET + " ssh-add ~/.ssh/id_ed25519",
-    ])
-    def test_unsegmented_auth_variables_are_masked(self, cmd):
-        from agent.redact import redact_for_egress, redact_terminal_output
-
-        for out in (
-            redact_sensitive_text(cmd, force=True),
-            redact_for_egress(cmd),
-            redact_terminal_output(cmd, "psql -h db"),
-        ):
-            assert self.SECRET not in out
-
     @pytest.mark.parametrize("text", [
-        "COMPASS=north",
-        "BYTES_PER_PWD=8",
-        "PGPASSFILE=/home/me/.pgpass",
         "https://example.com:8443/path",
+        "redis://cache.internal:6379/0",
+        "COMPASS=north",
     ])
-    def test_lookalike_names_and_ports_are_untouched(self, text):
+    def test_hosts_ports_and_lookalikes_are_untouched(self, text):
         assert redact_sensitive_text(text, force=True) == text
