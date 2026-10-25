@@ -225,6 +225,15 @@ _PREFIX_PATTERNS = [
 # and a bare ``password=…`` in a form body must not be swallowed greedily by ``\S+``. See #77484.
 _SECRET_ENV_NAMES = r"(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PW|CREDENTIAL|AUTH)"
 _ENV_ASSIGN_RE = re.compile(rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2")
+# ``_SECRET_ENV_NAMES`` matches credential *segments*, so it needs a separator before the
+# keyword: ``DB_PASSWORD`` and ``SOME_PW`` hit, while the CLI tools' non-interactive auth
+# variables do not — ``PGPASSWORD`` (psql), ``MYSQL_PWD`` (mysql) and ``SSH_PASSPHRASE`` carry
+# the password with no underscore in front of it and printed in full. Exact names only, so
+# ``COMPASS=`` or ``BYTES_PER_PWD=`` still pass through.
+_PASSWORD_ENV_EXACT_RE = re.compile(
+    r"\b(PGPASSWORD|MYSQL_PWD|SSH_PASSPHRASE)\s*=\s*(['\"]?)(\S+)\2",
+    re.IGNORECASE,
+)
 # Lowercase env names: only underscore-boundary forms (``openai_key=``) — NOT
 # bare ``password=``/``token=``, which appear in prose, URLs, and form bodies.
 # The lookbehind anchors each attempt to the start of an identifier run; without
@@ -529,7 +538,7 @@ _PRIVATE_KEY_RE = re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END
 # swallowing intervening lines and corrupting tool OUTPUT for any source containing a postgresql:// f-string
 # template. See issue #33801.
 _DB_CONNSTR_RE = re.compile(
-    r"((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:\s]+:)([^@\s]+)(@)",
+    r"((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:\s]*:)([^@\s]+)(@)",
     re.IGNORECASE,
 )
 
@@ -820,6 +829,15 @@ def _assignment_sub(render, *, check_keyword: bool):
     return _sub
 
 
+def _redact_password_env_names(text: str) -> str:
+    """Mask the CLI auth variables whose names carry no separator before the keyword."""
+    if "=" not in text:
+        return text
+    return _PASSWORD_ENV_EXACT_RE.sub(
+        lambda m: f"{m.group(1)}={m.group(2)}{_mask_token(m.group(3))}{m.group(2)}", text
+    )
+
+
 def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
     """ENV / config / JSON / YAML assignment passes (skipped for code files). Passes
     that would match ``token=``/``key=`` URL params skip ``://`` text (web-URL query
@@ -959,6 +977,10 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
 
     if not code_file:
         text = _redact_assignments(text, mask_nonreusable=file_read)
+
+    # Exact-name auth variables are credentials in any context, including a source dump that
+    # quotes a real command, so this pass is not gated on code_file.
+    text = _redact_password_env_names(text)
 
     if "uthorization" in text or "UTHORIZATION" in text:  # cheapest gate over every casing
         text = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)), text)
